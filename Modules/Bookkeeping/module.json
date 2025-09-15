@@ -1,0 +1,11 @@
+{
+    "name": "Bookkeeping",
+    "alias": "bookkeeping",
+    "description": "",
+    "keywords": [],
+    "priority": 0,
+    "providers": [
+        "Modules\\Bookkeeping\\Providers\\BookkeepingServiceProvider"
+    ],
+    "files": []
+}

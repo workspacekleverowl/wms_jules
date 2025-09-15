@@ -1,0 +1,30 @@
+{
+    "name": "nwidart/bookkeeping",
+    "description": "",
+    "authors": [
+        {
+            "name": "Nicolas Widart",
+            "email": "n.widart@gmail.com"
+        }
+    ],
+    "extra": {
+        "laravel": {
+            "providers": [],
+            "aliases": {
+
+            }
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Modules\\Bookkeeping\\": "app/",
+            "Modules\\Bookkeeping\\Database\\Factories\\": "database/factories/",
+            "Modules\\Bookkeeping\\Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Modules\\Bookkeeping\\Tests\\": "tests/"
+        }
+    }
+}
