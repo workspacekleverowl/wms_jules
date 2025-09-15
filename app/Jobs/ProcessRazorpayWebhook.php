@@ -61,15 +61,19 @@ class ProcessRazorpayWebhook implements ShouldQueue
             ->latest()
             ->first();
 
-        // Check for plan change flow
         $api = new RazorpayApi(env('RAZORPAY_KEY'), env('RAZORPAY_SECRET'));
         $razorpaySubscription = $api->subscription->fetch($subscription->razorpay_subscription_id);
 
-        if (isset($razorpaySubscription->notes['flow']) && $razorpaySubscription->notes['flow'] === 'plan_change') {
-            $this->handlePlanChange($subscription, $razorpaySubscription->notes);
-        }
-
         switch ($this->eventName) {
+            case 'subscription.authenticated':
+                $subscription->status = 'authenticated';
+                $subscription->save();
+                // This is a downgrade, schedule cancellation of the old plan
+                if (isset($razorpaySubscription->notes['flow']) && $razorpaySubscription->notes['flow'] === 'plan_change') {
+                    $this->handleDowngrade($razorpaySubscription->notes);
+                }
+                break;
+
             case 'subscription.activated':
                 $subscription->status = 'active';
                 $subscription->starts_at = Carbon::now();
@@ -78,7 +82,6 @@ class ProcessRazorpayWebhook implements ShouldQueue
                 break;
 
             case 'subscription.updated':
-                // This case might still be needed for other types of updates
                 $newPlan = Plan::where('razorpay_plan_id', $subscriptionPayload['plan_id'])->first();
                 if ($newPlan) {
                     $subscription->plan_id = $newPlan->id;
@@ -87,13 +90,18 @@ class ProcessRazorpayWebhook implements ShouldQueue
                 break;
 
             case 'subscription.charged':
-                $subscription->status = 'active'; // Ensure status is active on charge
+                $subscription->status = 'active';
                 $newEndDate = $subscription->ends_at ? Carbon::parse($subscription->ends_at) : Carbon::now();
                 $subscription->ends_at = ($subscription->plan->billing_interval === 'year')
                     ? $newEndDate->addYear()
                     : $newEndDate->addMonth();
                 $subscription->save();
                 Mail::to($subscription->user)->send(new SubscriptionCharged($subscription));
+
+                // This is an upgrade, cancel the old plan immediately
+                if (isset($razorpaySubscription->notes['flow']) && $razorpaySubscription->notes['flow'] === 'plan_change') {
+                    $this->handleUpgrade($razorpaySubscription->notes);
+                }
                 break;
 
             case 'subscription.cancelled':
@@ -119,43 +127,36 @@ class ProcessRazorpayWebhook implements ShouldQueue
     }
 
     /**
-     * Handle the logic for plan changes.
+     * Handle the logic for an upgrade.
      *
-     * @param \App\Models\Subscription $newSubscription
      * @param object $notes
      * @return void
      */
-    protected function handlePlanChange(Subscription $newSubscription, $notes)
+    protected function handleUpgrade($notes)
     {
-        $oldSubscription = Subscription::where('razorpay_subscription_id', $notes['old_subscription_id'])->with('plan')->first();
-
-        if (!$oldSubscription) {
-            Log::error('Plan Change: Old subscription not found for Razorpay ID: ' . $notes['old_subscription_id']);
-            return;
+        try {
+            $api = new RazorpayApi(env('RAZORPAY_KEY'), env('RAZORPAY_SECRET'));
+            $api->subscription->fetch($notes['old_subscription_id'])->cancel(['cancel_at_cycle_end' => false]);
+            Log::info('Plan Change (Upgrade): Cancelled old subscription immediately: ' . $notes['old_subscription_id']);
+        } catch (\Exception $e) {
+            Log::error('Plan Change (Upgrade): Failed to cancel old subscription: ' . $e->getMessage());
         }
+    }
 
-        $newPlan = $newSubscription->plan;
-        $oldPlan = $oldSubscription->plan;
-
-        $api = new RazorpayApi(env('RAZORPAY_KEY'), env('RAZORPAY_SECRET'));
-
-        // Upgrade: Cancel old subscription immediately
-        if ($newPlan->priority > $oldPlan->priority) {
-            try {
-                $api->subscription->fetch($oldSubscription->razorpay_subscription_id)->cancel(['cancel_at_cycle_end' => false]);
-                Log::info('Plan Change (Upgrade): Cancelled old subscription immediately: ' . $oldSubscription->razorpay_subscription_id);
-            } catch (\Exception $e) {
-                Log::error('Plan Change (Upgrade): Failed to cancel old subscription: ' . $e->getMessage());
-            }
-        }
-        // Downgrade: Cancel old subscription at the end of its cycle
-        else {
-            try {
-                $api->subscription->fetch($oldSubscription->razorpay_subscription_id)->cancel(['cancel_at_cycle_end' => true]);
-                Log::info('Plan Change (Downgrade): Scheduled cancellation for old subscription: ' . $oldSubscription->razorpay_subscription_id);
-            } catch (\Exception $e) {
-                Log::error('Plan Change (Downgrade): Failed to schedule cancellation for old subscription: ' . $e->getMessage());
-            }
+    /**
+     * Handle the logic for a downgrade.
+     *
+     * @param object $notes
+     * @return void
+     */
+    protected function handleDowngrade($notes)
+    {
+        try {
+            $api = new RazorpayApi(env('RAZORPAY_KEY'), env('RAZORPAY_SECRET'));
+            $api->subscription->fetch($notes['old_subscription_id'])->cancel(['cancel_at_cycle_end' => true]);
+            Log::info('Plan Change (Downgrade): Scheduled cancellation for old subscription: ' . $notes['old_subscription_id']);
+        } catch (\Exception $e) {
+            Log::error('Plan Change (Downgrade): Failed to schedule cancellation for old subscription: ' . $e->getMessage());
         }
     }
 }
