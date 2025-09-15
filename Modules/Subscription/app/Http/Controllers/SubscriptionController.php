@@ -5,6 +5,7 @@ namespace Modules\Subscription\Http\Controllers;
 use App\Http\Controllers\ApiController;
 use App\Models\Plan;
 use App\Models\Subscription;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Validator;
@@ -158,31 +159,68 @@ class SubscriptionController extends ApiController
         }
 
         try {
-            $subscription = Subscription::where('user_id',$user->id)
+            $oldSubscription = Subscription::where('user_id', $user->id)
                 ->where('status', 'active')
+                ->with('plan')
                 ->first();
 
-            if (!$subscription) {
+            if (!$oldSubscription) {
                 return $this->errorResponse404('No active subscription found to update.');
             }
 
-            if ($subscription->plan_id == $request->plan_id) {
+            if ($oldSubscription->plan_id == $request->plan_id) {
                 return $this->errorResponse('You are already subscribed to this plan.', 400);
             }
-            
+
             $newPlan = Plan::find($request->plan_id);
             $api = new RazorpayApi(env('RAZORPAY_KEY'), env('RAZORPAY_SECRET'));
 
-            $api->subscription->update($subscription->razorpay_subscription_id, [
-                'plan_id'             => $newPlan->razorpay_plan_id,
-                'schedule_change_at'  => 'cycle_end'
+            $notes = [
+                'flow' => 'plan_change',
+                'old_subscription_id' => $oldSubscription->razorpay_subscription_id,
+                'old_plan_id' => $oldSubscription->plan_id,
+                'new_plan_id' => $newPlan->id,
+            ];
+
+            $subscriptionData = [
+                'plan_id' => $newPlan->razorpay_plan_id,
+                'total_count' => $newPlan->billing_interval === 'year' ? 12 : 12,
+                'quantity' => 1,
+                'notes' => $notes,
+            ];
+
+            // Upgrade: new plan starts immediately
+            if ($newPlan->priority > $oldSubscription->plan->priority) {
+                // No start_at, starts immediately after payment
+            }
+            // Downgrade: new plan starts at the end of the current cycle
+            else {
+                $razorpayOldSubscription = $api->subscription->fetch($oldSubscription->razorpay_subscription_id);
+                $subscriptionData['start_at'] = $razorpayOldSubscription->current_end;
+            }
+
+            $razorpaySubscription = $api->subscription->create($subscriptionData);
+
+            // Create a new local subscription record, status is pending until payment
+            $newLocalSubscription = Subscription::create([
+                'user_id' => $user->id,
+                'plan_id' => $newPlan->id,
+                'razorpay_subscription_id' => $razorpaySubscription->id,
+                'status' => 'pending',
+                'notes' => 'Upgrade/Downgrade from ' . $oldSubscription->plan->name,
             ]);
 
-            // The local plan_id will be updated by the 'subscription.updated' webhook.
-            return $this->successResponse(null, 'Plan change scheduled successfully. Your new plan will be active from the next billing cycle.');
+            return $this->successResponse(
+                [
+                    'razorpay_subscription_id' => $razorpaySubscription->id,
+                    'subscription' => $newLocalSubscription,
+                    'action' => ($newPlan->priority > $oldSubscription->plan->priority) ? 'upgrade' : 'downgrade',
+                ],
+                'Subscription change initiated. Please complete the payment.'
+            );
 
         } catch (\Exception $e) {
-            return $this->errorResponse('Failed to schedule plan change: ' . $e->getMessage(), 500);
+            return $this->errorResponse('Failed to change subscription: ' . $e->getMessage(), 500);
         }
     }
 }
